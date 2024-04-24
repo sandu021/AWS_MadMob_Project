@@ -1,0 +1,116 @@
+import json
+import datetime
+import boto3
+from statistics import mean
+
+# Initialize DynamoDB resource
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('weekly_summary_table')
+
+def get_instance_metrics(instance_id):
+    # Create CloudWatch client
+    cloudwatch_client = boto3.client('cloudwatch')
+    
+    # Define the dimensions for the metric
+    dimensions = [
+        {
+            'Name': 'InstanceId',
+            'Value': instance_id
+        }
+    ]
+    
+    # Retrieve metrics for AWS/EC2 namespace
+    ec2_metrics = {}
+    ec2_metric_names = ['NetworkIn', 'NetworkOut', 'CPUUtilization', 'DiskReadBytes', 'DiskWriteBytes']
+    for metric_name in ec2_metric_names:
+        response = cloudwatch_client.get_metric_statistics(
+            Namespace='AWS/EC2',
+            MetricName=metric_name,
+            Dimensions=dimensions,
+            StartTime=datetime.datetime.utcnow() - datetime.timedelta(weeks=1),
+            EndTime=datetime.datetime.utcnow(),
+            Period=3600,  # 1 hour period for weekly data
+            Statistics=['Minimum', 'Maximum', 'Average']
+        )
+        
+        # Extract the statistics values from the response
+        statistics_values = []
+        if 'Datapoints' in response and len(response['Datapoints']) > 0:
+            statistics_values = [datapoint.get('Average', None) for datapoint in response['Datapoints']]
+        
+        # Calculate the weekly high, low, and average values
+        weekly_high = max(statistics_values) if statistics_values else None
+        weekly_low = min(statistics_values) if statistics_values else None
+        weekly_average = mean(statistics_values) if statistics_values else None
+        
+        # Store the calculated values
+        ec2_metrics[metric_name] = {
+            'WeeklyHigh': weekly_high,
+            'WeeklyLow': weekly_low,
+            'WeeklyAverage': weekly_average
+        }
+    
+    # Retrieve memory utilization metric for CWAgent namespace
+    cwagent_metrics = {}
+    cwagent_response = cloudwatch_client.get_metric_statistics(
+        Namespace='CWAgent',
+        MetricName='mem_used_percent',
+        Dimensions=dimensions,
+        StartTime=datetime.datetime.utcnow() - datetime.timedelta(weeks=1),
+        EndTime=datetime.datetime.utcnow(),
+        Period=3600,  # 1 hour period for weekly data
+        Statistics=['Minimum', 'Maximum', 'Average']
+    )
+    
+    # Extract the statistics values for memory utilization
+    mem_statistics_values = []
+    if 'Datapoints' in cwagent_response and len(cwagent_response['Datapoints']) > 0:
+        mem_statistics_values = [datapoint.get('Average', None) for datapoint in cwagent_response['Datapoints']]
+    
+    # Calculate the weekly high, low, and average values for memory utilization
+    mem_weekly_high = max(mem_statistics_values) if mem_statistics_values else None
+    mem_weekly_low = min(mem_statistics_values) if mem_statistics_values else None
+    mem_weekly_average = mean(mem_statistics_values) if mem_statistics_values else None
+    
+    # Store the calculated values for memory utilization
+    cwagent_metrics['mem_used_percent'] = {
+        'WeeklyHigh': mem_weekly_high,
+        'WeeklyLow': mem_weekly_low,
+        'WeeklyAverage': mem_weekly_average
+    }
+    
+    # Merge EC2 and CWAgent metrics
+    metrics = {**ec2_metrics, **cwagent_metrics}
+    
+    return metrics
+
+def lambda_handler(event, context):
+    # Get current timestamp
+    current_time = datetime.datetime.utcnow()
+    
+    # List of EC2 instance IDs to monitor
+    instance_ids = ['i-0d66cd2b52589c893', 'i-015fe6ca855e07fef', 'i-00d69df5765948355']
+    
+    # Iterate over each instance
+    for instance_id in instance_ids:
+        # Get metrics for the instance
+        instance_metrics = get_instance_metrics(instance_id)
+        
+        # Insert metrics data into DynamoDB table
+        for key, value in instance_metrics.items():
+            # Insert item into DynamoDB table with timestamp as sort key
+            table.put_item(
+                Item={
+                    'InstanceId': instance_id,
+                    'KeyStat_Name': key,
+                    'Timestamp': current_time.isoformat(),
+                    'WeeklyHigh': str(value['WeeklyHigh']) if value['WeeklyHigh'] is not None else "null",
+                    'WeeklyLow': str(value['WeeklyLow']) if value['WeeklyLow'] is not None else "null",
+                    'WeeklyAverage': str(value['WeeklyAverage']) if value['WeeklyAverage'] is not None else "null"
+                }
+            )
+    
+    return {
+        'statusCode': 200,
+        'body': 'Metrics data inserted into weekly summary DynamoDB table successfully'
+    }
