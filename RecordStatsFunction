@@ -1,0 +1,93 @@
+import json
+import datetime
+import boto3
+
+# Initialize DynamoDB resource
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('key_stat_table_new_new')
+
+def get_instance_metrics(instance_id):
+    # Create CloudWatch client
+    cloudwatch_client = boto3.client('cloudwatch')
+    
+    # Define the dimensions for the metric
+    dimensions = [
+        {
+            'Name': 'InstanceId',
+            'Value': instance_id
+        }
+    ]
+    
+    # Retrieve metrics for AWS/EC2 namespace
+    ec2_metrics = {}
+    ec2_metric_names = ['NetworkIn', 'NetworkOut', 'CPUUtilization', 'DiskReadBytes', 'DiskWriteBytes']
+    for metric_name in ec2_metric_names:
+        response = cloudwatch_client.get_metric_statistics(
+            Namespace='AWS/EC2',
+            MetricName=metric_name,
+            Dimensions=dimensions,
+            StartTime=datetime.datetime.utcnow() - datetime.timedelta(minutes=1),
+            EndTime=datetime.datetime.utcnow(),
+            Period=60,
+            Statistics=['Average']
+        )
+        
+        # Extract the average value from the response
+        average_value = None
+        if 'Datapoints' in response and len(response['Datapoints']) > 0:
+            average_value = response['Datapoints'][0].get('Average', None)
+        
+        ec2_metrics[metric_name] = average_value
+    
+    # Retrieve memory utilization metric for CWAgent namespace
+    cwagent_metrics = {}
+    cwagent_response = cloudwatch_client.get_metric_statistics(
+        Namespace='CWAgent',
+        MetricName='mem_used_percent',
+        Dimensions=dimensions,
+        StartTime=datetime.datetime.utcnow() - datetime.timedelta(minutes=1),
+        EndTime=datetime.datetime.utcnow(),
+        Period=60,
+        Statistics=['Average']
+    )
+    
+    # Extract the average value for memory utilization
+    mem_used_percent = None
+    if 'Datapoints' in cwagent_response and len(cwagent_response['Datapoints']) > 0:
+        mem_used_percent = cwagent_response['Datapoints'][0].get('Average', None)
+    
+    cwagent_metrics['mem_used_percent'] = mem_used_percent
+    
+    # Merge EC2 and CWAgent metrics
+    metrics = {**ec2_metrics, **cwagent_metrics}
+    
+    return metrics
+
+def lambda_handler(event, context):
+    # Get current timestamp
+    current_time = datetime.datetime.utcnow()
+    
+    # List of EC2 instance IDs to monitor
+    instance_ids = ['i-0d66cd2b52589c893', 'i-015fe6ca855e07fef', 'i-00d69df5765948355']
+    
+    # Iterate over each instance
+    for instance_id in instance_ids:
+        # Get metrics for the instance
+        instance_metrics = get_instance_metrics(instance_id)
+        
+        # Insert metrics data into DynamoDB table
+        for key, value in instance_metrics.items():
+            # Insert item into DynamoDB table with timestamp as sort key
+            table.put_item(
+                Item={
+                    'InstanceId': instance_id,
+                    'KeyStat_Name': key,
+                    'Timestamp': current_time.isoformat(),
+                    'Value': str(value) if value is not None else "null"  # Convert None to "null" string
+                }
+            )
+    
+    return {
+        'statusCode': 200,
+        'body': 'Metrics data inserted into DynamoDB table successfully'
+    }
